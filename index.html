@@ -119,9 +119,25 @@
                     return db;
                 }
             } catch (err) {
-                console.warn('API-dən məlumat alınarkən xəta yarandı, yerli daxili məlumat istifadə olunur:', err);
+                console.warn('API-dən məlumat alınarkən xəta yarandı:', err);
             }
             return getDB();
+        }
+
+        // Send actions to Google Apps Script POST Webhook
+        async function sendRemoteData(action, payload) {
+            try {
+                await fetch(API_URL, {
+                    method: 'POST',
+                    mode: 'no-cors',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ action, ...payload })
+                });
+            } catch (err) {
+                console.error('Серверге данные отправкасы zamanı xəta:', err);
+            }
         }
 
         /**
@@ -178,7 +194,6 @@
                             return `${st ? st.student_name : 'Tələbə'}: ${a.reason}`;
                         }).join('; ');
 
-                        // Increment lessons for present students as well
                         params.attendance.filter(a => a.present).forEach(a => {
                             const st = db.students.find(s => s.id === a.studentId);
                             if (st && params.lessonIncrement) {
@@ -197,6 +212,10 @@
 
                 saveDB(db);
                 api.addLog(params.teacherLogin, 'ATTENDANCE', logText);
+
+                // Отправка запроса на запись в Google Таблицу
+                sendRemoteData('markAttendance', params);
+
                 return { success: true, message: 'Davamiyyət və dərs uğurla qeydə alındı.' };
             },
 
@@ -216,6 +235,10 @@
 
                 saveDB(db);
                 api.addLog(actor, 'PAYMENT', `Yeni paket aktivləşdirildi (${studentIds.length} tələbə üçün). Tələbələr: ${renewedNames.join(', ')}`);
+
+                // Отправка в Google Таблицу
+                sendRemoteData('bulkRenewPackage', { studentIds });
+
                 return { success: true, message: 'Seçilmiş tələbələr üçün yeni paket başladı! (0 dərs keçilib)' };
             },
 
@@ -244,6 +267,10 @@
 
                 saveDB(db);
                 api.addLog(currentUser ? currentUser.login : 'admin', 'GROUP', `Yeni qrup yaradıldı: ${newGrp.group_name}`);
+
+                // Отправка в Google Таблицу
+                sendRemoteData('addGroup', { group: newGrp, studentIds: groupData.studentIds });
+
                 return { success: true, group: newGrp };
             },
 
@@ -264,6 +291,9 @@
                     db.groups.splice(grpIndex, 1);
                     saveDB(db);
                     api.addLog(currentUser ? currentUser.login : 'admin', 'GROUP', `Qrup silindi: ${name}`);
+
+                    sendRemoteData('deleteGroup', { groupId });
+
                     return { success: true };
                 }
             },
@@ -286,6 +316,9 @@
                     db.students.push(newStudent);
                     saveDB(db);
                     api.addLog(currentUser ? currentUser.login : 'admin', 'USER', `Yeni tələbə əlavə edildi: ${newStudent.student_name}`);
+
+                    sendRemoteData('addStudent', { student: newStudent });
+
                     return { success: true, data: newStudent };
                 } else {
                     const newUser = {
@@ -298,6 +331,9 @@
                     db.users.push(newUser);
                     saveDB(db);
                     api.addLog(currentUser ? currentUser.login : 'admin', 'USER', `Yeni müəllim əlavə edildi: ${newUser.name} (${newUser.subject})`);
+
+                    sendRemoteData('addUser', { user: newUser });
+
                     return { success: true, data: newUser };
                 }
             },
@@ -311,6 +347,7 @@
                         db.students.splice(idx, 1);
                         saveDB(db);
                         api.addLog(currentUser ? currentUser.login : 'admin', 'USER', `Tələbə silindi: ${name}`);
+                        sendRemoteData('deleteStudent', { id: idOrLogin });
                     }
                 } else {
                     const idx = db.users.findIndex(u => u.login === idOrLogin);
@@ -319,6 +356,7 @@
                         db.users.splice(idx, 1);
                         saveDB(db);
                         api.addLog(currentUser ? currentUser.login : 'admin', 'USER', `Müəllim silindi: ${name}`);
+                        sendRemoteData('deleteUser', { login: idOrLogin });
                     }
                 }
                 return { success: true };
@@ -329,13 +367,16 @@
                 const db = getDB();
                 const now = new Date();
                 const dateStr = now.toLocaleDateString('az-AZ') + ' ' + now.toLocaleTimeString('az-AZ');
-                db.logs.unshift({
+                const logItem = {
                     timestamp: dateStr,
                     actor: actor,
                     action_type: action_type,
                     details: details
-                });
+                };
+                db.logs.unshift(logItem);
                 saveDB(db);
+
+                sendRemoteData('addLog', { log: logItem });
             }
         };
 
