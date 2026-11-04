@@ -124,8 +124,8 @@
             return getDB();
         }
 
-        // Send actions to Google Apps Script POST Webhook
-        async function sendRemoteData(action, payload) {
+        // Send actions directly matching backend GAS switch-cases
+        async function sendRemoteData(payload) {
             try {
                 await fetch(API_URL, {
                     method: 'POST',
@@ -133,10 +133,10 @@
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify({ action, ...payload })
+                    body: JSON.stringify(payload)
                 });
             } catch (err) {
-                console.error('Серверге данные отправкасы zamanı xəta:', err);
+                console.error('Google Sheets-ə göndərilərkən xəta:', err);
             }
         }
 
@@ -149,9 +149,14 @@
             // Authentication
             login: async (username, password) => {
                 const db = await fetchRemoteData();
-                const user = db.users.find(u => u.login.toLowerCase() === username.toLowerCase() && u.password === password);
+                const user = db.users.find(u => u.login.toLowerCase() === username.toLowerCase() && String(u.password) === String(password));
                 if (user) {
-                    api.addLog(user.login, 'LOGIN', `Müəllim/Admin ${user.name} sistemə daxil oldu`);
+                    const actor = user.login;
+                    const details = `İstifadəçi '${actor}' sistemə daxil oldu.`;
+                    
+                    api.addLocalLog(actor, 'LOGIN', details);
+                    sendRemoteData({ action: 'LOGIN', actor, details });
+
                     return { success: true, user };
                 } else {
                     return { success: false, message: 'İstifadəçi adı və ya şifrə yanlışdır.' };
@@ -161,83 +166,78 @@
             // Attendance & Lesson Completion
             markAttendance: async (params) => {
                 const db = getDB();
-                let logText = '';
+                const actor = params.teacherLogin;
+                let studentsPayload = [];
 
                 if (params.type === 'individual') {
-                    const std = db.students.find(s => s.id === params.targetId);
+                    const std = db.students.find(s => String(s.id) === String(params.targetId));
                     if (std) {
                         const att = params.attendance[0];
-                        let completed = parseInt(std.lessons_completed || 0);
-                        let total = parseInt(std.package_type || 8);
+                        let completed = Number(std.lessons_completed) || 0;
+                        let total = Number(std.package_type) || 8;
                         
-                        if (params.lessonIncrement) {
+                        if (params.lessonIncrement && att.present) {
                             std.lessons_completed = Math.min(total, completed + 1).toString();
                         }
-                        
-                        if (!att.present) {
-                            logText = `${std.student_name} üçün dərs qeydi: Qayıb (NB). Səbəb: ${att.reason || 'Bilmədən'}`;
-                        } else {
-                            logText = `${std.student_name} üçün dərs iştirakı qeydə alındı (${std.lessons_completed}/${std.package_type}).`;
-                        }
+
+                        studentsPayload.push({
+                            id: std.id,
+                            status: att.present ? 'present' : 'absent',
+                            reason: att.reason || ''
+                        });
                     }
                 } else if (params.type === 'group') {
-                    const grp = db.groups.find(g => g.group_id === params.targetId);
-                    if (grp) {
-                        const absents = params.attendance.filter(a => !a.present);
-                        let absentDetails = absents.map(a => {
-                            const st = db.students.find(s => s.id === a.studentId);
-                            if (st && params.lessonIncrement) {
-                                let completed = parseInt(st.lessons_completed || 0);
-                                let total = parseInt(st.package_type || 8);
+                    params.attendance.forEach(att => {
+                        const st = db.students.find(s => String(s.id) === String(att.studentId));
+                        if (st) {
+                            let completed = Number(st.lessons_completed) || 0;
+                            let total = Number(st.package_type) || 8;
+
+                            if (params.lessonIncrement && att.present) {
                                 st.lessons_completed = Math.min(total, completed + 1).toString();
                             }
-                            return `${st ? st.student_name : 'Tələbə'}: ${a.reason}`;
-                        }).join('; ');
 
-                        params.attendance.filter(a => a.present).forEach(a => {
-                            const st = db.students.find(s => s.id === a.studentId);
-                            if (st && params.lessonIncrement) {
-                                let completed = parseInt(st.lessons_completed || 0);
-                                let total = parseInt(st.package_type || 8);
-                                st.lessons_completed = Math.min(total, completed + 1).toString();
-                            }
-                        });
-
-                        logText = `${grp.group_name} qrupu üçün dərs qeydə alındı.`;
-                        if (absents.length > 0) {
-                            logText += ` Qayıblar (NB): ${absentDetails}`;
+                            studentsPayload.push({
+                                id: st.id,
+                                status: att.present ? 'present' : 'absent',
+                                reason: att.reason || ''
+                            });
                         }
-                    }
+                    });
                 }
 
                 saveDB(db);
-                api.addLog(params.teacherLogin, 'ATTENDANCE', logText);
 
-                // Отправка запроса на запись в Google Таблицу
-                sendRemoteData('markAttendance', params);
+                // Отправка в GAS (MARK_LESSON)
+                sendRemoteData({
+                    action: 'MARK_LESSON',
+                    actor: actor,
+                    students: studentsPayload
+                });
 
                 return { success: true, message: 'Davamiyyət və dərs uğurla qeydə alındı.' };
             },
 
-            // Payments & Package Renewal
+            // Payments & Package Renewal (Сброс уроков)
             bulkRenewPackage: async (studentIds) => {
                 const db = getDB();
                 const actor = currentUser ? currentUser.login : 'admin';
-                let renewedNames = [];
 
                 studentIds.forEach(id => {
-                    const std = db.students.find(s => s.id === id);
+                    const std = db.students.find(s => String(s.id) === String(id));
                     if (std) {
                         std.lessons_completed = "0";
-                        renewedNames.push(std.student_name);
                     }
                 });
 
                 saveDB(db);
-                api.addLog(actor, 'PAYMENT', `Yeni paket aktivləşdirildi (${studentIds.length} tələbə üçün). Tələbələr: ${renewedNames.join(', ')}`);
 
-                // Отправка в Google Таблицу
-                sendRemoteData('bulkRenewPackage', { studentIds });
+                // Отправка в GAS (UPDATE_PACKAGE)
+                sendRemoteData({
+                    action: 'UPDATE_PACKAGE',
+                    actor: actor,
+                    student_ids: studentIds
+                });
 
                 return { success: true, message: 'Seçilmiş tələbələr üçün yeni paket başladı! (0 dərs keçilib)' };
             },
@@ -245,8 +245,9 @@
             // Group Management
             addGroup: async (groupData) => {
                 const db = getDB();
+                const groupId = 'grp_' + Date.now();
                 const newGrp = {
-                    group_id: 'grp_' + Date.now(),
+                    group_id: groupId,
                     group_name: groupData.name,
                     teacher_login: groupData.teacherLogin,
                     package_type: groupData.totalPackage.toString()
@@ -255,10 +256,10 @@
 
                 if (groupData.studentIds && groupData.studentIds.length > 0) {
                     groupData.studentIds.forEach(stId => {
-                        const st = db.students.find(s => s.id === stId);
+                        const st = db.students.find(s => String(s.id) === String(stId));
                         if (st) {
                             st.type = 'group';
-                            st.group_id = newGrp.group_id;
+                            st.group_id = groupId;
                             st.teacher_login = '';
                             st.lessons_completed = "0";
                         }
@@ -266,21 +267,27 @@
                 }
 
                 saveDB(db);
-                api.addLog(currentUser ? currentUser.login : 'admin', 'GROUP', `Yeni qrup yaradıldı: ${newGrp.group_name}`);
 
-                // Отправка в Google Таблицу
-                sendRemoteData('addGroup', { group: newGrp, studentIds: groupData.studentIds });
+                // Отправка в GAS (CREATE_GROUP)
+                sendRemoteData({
+                    action: 'CREATE_GROUP',
+                    actor: currentUser ? currentUser.login : 'admin',
+                    group_id: groupId,
+                    group_name: groupData.name,
+                    teacher_login: groupData.teacherLogin,
+                    package_type: Number(groupData.totalPackage),
+                    student_ids: groupData.studentIds || []
+                });
 
                 return { success: true, group: newGrp };
             },
 
             deleteGroup: async (groupId) => {
                 const db = getDB();
-                const grpIndex = db.groups.findIndex(g => g.group_id === groupId);
+                const grpIndex = db.groups.findIndex(g => String(g.group_id) === String(groupId));
                 if (grpIndex !== -1) {
-                    const name = db.groups[grpIndex].group_name;
                     db.students.forEach(st => {
-                        if (st.group_id === groupId) {
+                        if (String(st.group_id) === String(groupId)) {
                             st.type = 'individual';
                             st.group_id = '';
                             st.teacher_login = db.users.find(u => u.role === 'teacher')?.login || '';
@@ -290,9 +297,13 @@
                     });
                     db.groups.splice(grpIndex, 1);
                     saveDB(db);
-                    api.addLog(currentUser ? currentUser.login : 'admin', 'GROUP', `Qrup silindi: ${name}`);
 
-                    sendRemoteData('deleteGroup', { groupId });
+                    // Отправка в GAS (DELETE_GROUP)
+                    sendRemoteData({
+                        action: 'DELETE_GROUP',
+                        actor: currentUser ? currentUser.login : 'admin',
+                        group_id: groupId
+                    });
 
                     return { success: true };
                 }
@@ -301,82 +312,100 @@
             // User & Student Creation / Deletion
             addUser: async (userData) => {
                 const db = getDB();
+                const actor = currentUser ? currentUser.login : 'admin';
+
                 if (userData.role === 'student') {
-                    const newStudent = {
+                    const studentData = {
                         id: 'st_' + Date.now(),
                         student_name: userData.name,
                         type: userData.type || 'individual',
                         group_id: userData.groupId || '',
                         teacher_login: userData.teacherLogin || '',
-                        package_type: (userData.totalPackage || 8).toString(),
-                        lessons_completed: "0",
+                        package_type: Number(userData.totalPackage) || 8,
+                        lessons_completed: 0,
                         added_date: new Date().toISOString().split('T')[0],
                         history: "[]"
                     };
-                    db.students.push(newStudent);
+
+                    db.students.push(studentData);
                     saveDB(db);
-                    api.addLog(currentUser ? currentUser.login : 'admin', 'USER', `Yeni tələbə əlavə edildi: ${newStudent.student_name}`);
 
-                    sendRemoteData('addStudent', { student: newStudent });
+                    // Отправка в GAS (ADD_STUDENT)
+                    sendRemoteData({
+                        action: 'ADD_STUDENT',
+                        actor: actor,
+                        student_data: studentData
+                    });
 
-                    return { success: true, data: newStudent };
+                    return { success: true, data: studentData };
                 } else {
-                    const newUser = {
+                    const teacherData = {
                         login: userData.username,
                         password: userData.password || 'pass123',
                         name: userData.name,
-                        role: 'teacher',
                         subject: userData.subject || 'Ümumi'
                     };
-                    db.users.push(newUser);
+
+                    db.users.push({ ...teacherData, role: 'teacher' });
                     saveDB(db);
-                    api.addLog(currentUser ? currentUser.login : 'admin', 'USER', `Yeni müəllim əlavə edildi: ${newUser.name} (${newUser.subject})`);
 
-                    sendRemoteData('addUser', { user: newUser });
+                    // Отправка в GAS (ADD_TEACHER)
+                    sendRemoteData({
+                        action: 'ADD_TEACHER',
+                        actor: actor,
+                        teacher_data: teacherData
+                    });
 
-                    return { success: true, data: newUser };
+                    return { success: true, data: teacherData };
                 }
             },
 
             deleteUser: async (idOrLogin, role) => {
                 const db = getDB();
+                const actor = currentUser ? currentUser.login : 'admin';
+
                 if (role === 'student') {
-                    const idx = db.students.findIndex(s => s.id === idOrLogin);
+                    const idx = db.students.findIndex(s => String(s.id) === String(idOrLogin));
                     if (idx !== -1) {
-                        const name = db.students[idx].student_name;
                         db.students.splice(idx, 1);
                         saveDB(db);
-                        api.addLog(currentUser ? currentUser.login : 'admin', 'USER', `Tələbə silindi: ${name}`);
-                        sendRemoteData('deleteStudent', { id: idOrLogin });
+
+                        // Отправка в GAS (DELETE_STUDENT)
+                        sendRemoteData({
+                            action: 'DELETE_STUDENT',
+                            actor: actor,
+                            id: idOrLogin
+                        });
                     }
                 } else {
-                    const idx = db.users.findIndex(u => u.login === idOrLogin);
+                    const idx = db.users.findIndex(u => String(u.login) === String(idOrLogin));
                     if (idx !== -1) {
-                        const name = db.users[idx].name;
                         db.users.splice(idx, 1);
                         saveDB(db);
-                        api.addLog(currentUser ? currentUser.login : 'admin', 'USER', `Müəllim silindi: ${name}`);
-                        sendRemoteData('deleteUser', { login: idOrLogin });
+
+                        // Отправка в GAS (DELETE_TEACHER)
+                        sendRemoteData({
+                            action: 'DELETE_TEACHER',
+                            actor: actor,
+                            login: idOrLogin
+                        });
                     }
                 }
                 return { success: true };
             },
 
-            // History Logs Helper
-            addLog: (actor, action_type, details) => {
+            // History Logs Local Helper
+            addLocalLog: (actor, action_type, details) => {
                 const db = getDB();
                 const now = new Date();
                 const dateStr = now.toLocaleDateString('az-AZ') + ' ' + now.toLocaleTimeString('az-AZ');
-                const logItem = {
+                db.logs.unshift({
                     timestamp: dateStr,
                     actor: actor,
                     action_type: action_type,
                     details: details
-                };
-                db.logs.unshift(logItem);
+                });
                 saveDB(db);
-
-                sendRemoteData('addLog', { log: logItem });
             }
         };
 
@@ -533,8 +562,8 @@
          */
         function renderTeacherPanel() {
             const db = getDB();
-            const teacherStudents = db.students.filter(s => s.type === 'individual' && s.teacher_login === currentUser.login);
-            const teacherGroups = db.groups.filter(g => g.teacher_login === currentUser.login);
+            const teacherStudents = db.students.filter(s => s.type === 'individual' && String(s.teacher_login) === String(currentUser.login));
+            const teacherGroups = db.groups.filter(g => String(g.teacher_login) === String(currentUser.login));
 
             return `
             <div class="min-h-screen flex flex-col bg-slate-50">
@@ -636,8 +665,8 @@
             return `
             <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
                 ${students.map(s => {
-                    const completed = parseInt(s.lessons_completed || 0);
-                    const total = parseInt(s.package_type || 8);
+                    const completed = Number(s.lessons_completed) || 0;
+                    const total = Number(s.package_type) || 8;
                     const isCompleted = completed >= total;
 
                     return `
@@ -698,8 +727,8 @@
             return `
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 ${groups.map(g => {
-                    const groupStudents = db.students.filter(s => s.type === 'group' && s.group_id === g.group_id);
-                    const totalPkg = parseInt(g.package_type || 8);
+                    const groupStudents = db.students.filter(s => s.type === 'group' && String(s.group_id) === String(g.group_id));
+                    const totalPkg = Number(g.package_type) || 8;
 
                     return `
                     <div class="bg-white rounded-3xl p-6 border border-slate-100 shadow-sm flex flex-col justify-between">
@@ -857,7 +886,7 @@
                     const badge = document.getElementById(`nb-reason-badge-${stId}`);
                     if (!chk.checked) {
                         const db = getDB();
-                        const st = db.students.find(s => s.id === stId);
+                        const st = db.students.find(s => String(s.id) === String(stId));
                         pendingNbStudent = {
                             id: stId,
                             name: st ? st.student_name : 'Tələbə',
@@ -1114,7 +1143,7 @@
 
                         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
                             ${db.groups.map(g => {
-                                const grpStudents = db.students.filter(s => s.type === 'group' && s.group_id === g.group_id);
+                                const grpStudents = db.students.filter(s => s.type === 'group' && String(s.group_id) === String(g.group_id));
                                 return `
                                 <div class="bg-white rounded-3xl p-6 border border-slate-100 shadow-sm">
                                     <div class="flex items-center justify-between pb-3 mb-4 border-b border-slate-100">
@@ -1164,8 +1193,8 @@
                                     </thead>
                                     <tbody class="divide-y divide-slate-100">
                                         ${individualStudents.map(s => {
-                                            const completed = parseInt(s.lessons_completed || 0);
-                                            const total = parseInt(s.package_type || 8);
+                                            const completed = Number(s.lessons_completed) || 0;
+                                            const total = Number(s.package_type) || 8;
                                             const isFinished = completed >= total;
                                             return `
                                             <tr class="hover:bg-slate-50/60 transition">
@@ -1206,8 +1235,8 @@
 
                     <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                         ${db.groups.map(g => {
-                            const teacher = db.users.find(u => u.login === g.teacher_login);
-                            const members = db.students.filter(s => s.type === 'group' && s.group_id === g.group_id);
+                            const teacher = db.users.find(u => String(u.login) === String(g.teacher_login));
+                            const members = db.students.filter(s => s.type === 'group' && String(s.group_id) === String(g.group_id));
                             return `
                             <div class="bg-white rounded-3xl p-6 border border-slate-100 shadow-sm flex flex-col justify-between relative group hover:shadow-md transition">
                                 <div>
@@ -1298,8 +1327,8 @@
                         <div class="flex items-center gap-1.5 overflow-x-auto w-full sm:w-auto">
                             <button data-log-filter="all" class="log-filter-btn px-3 py-1.5 rounded-xl text-xs font-semibold bg-orange-500 text-white shadow-sm">Bütün loglar</button>
                             <button data-log-filter="LOGIN" class="log-filter-btn px-3 py-1.5 rounded-xl text-xs font-semibold bg-white text-slate-600 border border-slate-200">Girişlər</button>
-                            <button data-log-filter="ATTENDANCE" class="log-filter-btn px-3 py-1.5 rounded-xl text-xs font-semibold bg-white text-slate-600 border border-slate-200">Davamiyyət</button>
-                            <button data-log-filter="PAYMENT" class="log-filter-btn px-3 py-1.5 rounded-xl text-xs font-semibold bg-white text-slate-600 border border-slate-200">Ödənişlər</button>
+                            <button data-log-filter="MARK_LESSON" class="log-filter-btn px-3 py-1.5 rounded-xl text-xs font-semibold bg-white text-slate-600 border border-slate-200">Davamiyyət</button>
+                            <button data-log-filter="UPDATE_PACKAGE" class="log-filter-btn px-3 py-1.5 rounded-xl text-xs font-semibold bg-white text-slate-600 border border-slate-200">Ödənişlər</button>
                         </div>
                     </div>
 
@@ -1383,7 +1412,7 @@
                     <td class="p-4 text-slate-400 whitespace-nowrap font-mono text-[11px]">${l.timestamp}</td>
                     <td class="p-4 font-semibold text-slate-800">${l.actor}</td>
                     <td class="p-4">
-                        <span class="px-2 py-0.5 rounded text-[10px] font-semibold uppercase ${l.action_type === 'LOGIN' ? 'bg-blue-50 text-blue-600' : l.action_type === 'ATTENDANCE' ? 'bg-orange-50 text-orange-600' : l.action_type === 'PAYMENT' ? 'bg-green-50 text-green-600' : 'bg-slate-100 text-slate-600'}">
+                        <span class="px-2 py-0.5 rounded text-[10px] font-semibold uppercase ${l.action_type === 'LOGIN' ? 'bg-blue-50 text-blue-600' : l.action_type === 'MARK_LESSON' ? 'bg-orange-50 text-orange-600' : l.action_type === 'UPDATE_PACKAGE' ? 'bg-green-50 text-green-600' : 'bg-slate-100 text-slate-600'}">
                             ${l.action_type}
                         </span>
                     </td>
